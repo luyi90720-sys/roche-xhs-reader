@@ -356,55 +356,84 @@ async function getSharerName() {
 }
 
 // ============================================================
-// 强制刷新 Roche 聊天界面（核心 hack）
+// 查找 Vue Pinia store 中的 reactive 消息数组
 // ============================================================
-// Roche 用 Vue 3 reactive 追踪 store[conversationId] 数组
-// 外部直接改 IndexedDB 不会触发重渲染
-// 通过派发 roche-open-chat-request 事件，让 Roche 重新挂载 Chat 组件并重新加载消息
-function refreshRocheChat(conversationId) {
+function findPiniaMessagesArray(cid) {
+  try {
+    const roots = [
+      document.querySelector('#app'),
+      document.querySelector('[data-v-app]'),
+      document.getElementById('app')
+    ].filter(Boolean);
+
+    for (const el of roots) {
+      const app = el.__vue_app__;
+      if (!app) continue;
+      const pinia = app.config.globalProperties?.$pinia;
+      if (!pinia?._s) continue;
+      for (const [storeId, store] of pinia._s) {
+        const state = store.$state || store;
+        const val = state[cid];
+        if (val !== undefined && Array.isArray(val)) return { arr: val };
+        if (store[cid] !== undefined && Array.isArray(store[cid])) return { arr: store[cid] };
+      }
+    }
+  } catch (e) {
+    log(`findPiniaMessagesArray: ${e.message}`, 'warn');
+  }
+  return null;
+}
+
+// ============================================================
+// 刷新 Roche 聊天界面
+// ============================================================
+// 方案 A：找到 Pinia store 的 reactive 数组 → 重读 DB → splice → 触发 Vue 重渲染
+// 方案 B：事件派发兜底
+async function refreshRocheChat(conversationId) {
   try {
     if (!conversationId) return;
     const cid = String(conversationId);
 
-    // Roche 用 Vue 3 reactive 追踪内存中的 store[conversationId] 数组
-    // 外部直接改 IndexedDB 不会触发重渲染
-    // 通过延时级联派发事件，让 Roche 重新挂载 Chat 组件并重新加载消息
+    // ---- 方案 A：Pinia store 直改 ----
+    const found = findPiniaMessagesArray(cid);
+    if (found) {
+      try {
+        let msgs = [];
+        try {
+          const result = await runtime.roche.memory.getShortTerm({ conversationId: cid, limit: 50 });
+          msgs = Array.isArray(result) ? result : (result?.messages || []);
+        } catch (apiErr) {
+          msgs = await getMessagesByConversation(cid);
+        }
+        if (msgs.length > 0) {
+          found.arr.splice(0, found.arr.length, ...msgs);
+          log(`refreshRocheChat: Pinia splice ${msgs.length} 条`, 'success');
+          return;
+        }
+      } catch (e) {
+        log(`refreshRocheChat: Pinia 异常: ${e.message}`, 'warn');
+      }
+    }
 
-    // 立即发：roche-open-chat-request（触发组件重挂载）
+    // ---- 方案 B：事件兜底 ----
     try {
       window.dispatchEvent(new CustomEvent('roche-open-chat-request', {
         detail: { conversationId: cid, pushType: '', source: 'xhs-reader-plugin' }
       }));
     } catch (e) {}
-
-    // 50ms 后：roche-messages-updated（触发 store 重新读取）
+    try {
+      document.dispatchEvent(new CustomEvent('roche-open-chat-request', {
+        detail: { conversationId: cid, pushType: '', source: 'xhs-reader-plugin' }
+      }));
+    } catch (e) {}
     setTimeout(() => {
       try {
         window.dispatchEvent(new CustomEvent('roche-messages-updated', {
           detail: { conversationId: cid, source: 'xhs-reader-plugin' }
         }));
       } catch (e) {}
-    }, 50);
-
-    // 150ms 后：通用 messages-updated（兜底事件）
-    setTimeout(() => {
-      try {
-        window.dispatchEvent(new CustomEvent('messages-updated', {
-          detail: { conversationId: cid }
-        }));
-      } catch (e) {}
-    }, 150);
-
-    // 300ms 后：再发一次 roche-open-chat-request，确保重挂载
-    setTimeout(() => {
-      try {
-        window.dispatchEvent(new CustomEvent('roche-open-chat-request', {
-          detail: { conversationId: cid, pushType: '', source: 'xhs-reader-plugin' }
-        }));
-      } catch (e) {}
-    }, 300);
-
-    log(`refreshRocheChat: 已派发级联刷新事件到会话 ${cid}`, 'info');
+    }, 100);
+    log(`refreshRocheChat: 事件刷新 ${cid}`, 'info');
   } catch (e) {
     log(`refreshRocheChat 失败: ${e.message}`, 'error');
   }
