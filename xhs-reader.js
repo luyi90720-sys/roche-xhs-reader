@@ -1,26 +1,26 @@
 /**
- * Roche 小红书链接注入器 v2.4.0
+ * Roche 小红书链接注入器 v2.4.2
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
  *                            注入：总结文本（详尽，500字左右）+ 评论 + 卡片占位符
  *
- * v2.4.0 关键改进：
- *   1. 隐藏悬浮球
- *   2. 每次启动插件都不自动监听，必须用户手动开启（unmount 时停止监听）
- *   3. 代理顺序调整：codetabs 优先（allorigins 和 corsproxy 总是失败）
- *   4. 取消自动删除功能（用户自己处理）
- *   5. 轮询间隔从 300ms 改为 2s，只读最新 3 条消息，避免 Roche reactive 系统变卡
- *   6. 模式二注入后多事件派发刷新 UI
+ * v2.4.2 关键改进：
+ *   1. 关闭面板不停止监听（后台继续运行）
+ *   2. 恢复 autoListen 状态自动重启
+ *   3. HTML 抓取代理 corsproxy 优先
+ *   4. 会话上限 3 个
+ *   5. extractXhsUrl 修复反引号/多段路径匹配
+ *   6. refreshRocheChat 深搜 Pinia store + 直接读 IndexedDB + splice
  *
  * 触发方式：监听消息库，用户回车后 2s 内立即替换
- * 重要：插件 App 关闭后停止监听（每次启动都需要用户手动开启）
+ * 重要：关闭面板后监听继续在后台运行
  */
 
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.4.0",
+  version: "2.4.2",
   apps: [
     {
       id: "xhs-reader-home",
@@ -356,14 +356,17 @@ async function getSharerName() {
 }
 
 // ============================================================
-// 查找 Vue Pinia store 中的 reactive 消息数组
+// 查找 Vue Pinia store 中的 reactive 消息数组（深层搜索 + 日志）
 // ============================================================
 function findPiniaMessagesArray(cid) {
+  const logStores = [];
   try {
+    // 尝试多个可能的 Vue app 根元素
     const roots = [
       document.querySelector('#app'),
       document.querySelector('[data-v-app]'),
-      document.getElementById('app')
+      document.getElementById('app'),
+      document.body.firstElementChild
     ].filter(Boolean);
 
     for (const el of roots) {
@@ -371,58 +374,76 @@ function findPiniaMessagesArray(cid) {
       if (!app) continue;
       const pinia = app.config.globalProperties?.$pinia;
       if (!pinia?._s) continue;
+
       for (const [storeId, store] of pinia._s) {
         const state = store.$state || store;
-        const val = state[cid];
-        if (val !== undefined && Array.isArray(val)) return { arr: val };
-        if (store[cid] !== undefined && Array.isArray(store[cid])) return { arr: store[cid] };
+        const keys = Object.keys(state).slice(0, 10);
+        logStores.push(`${storeId}(${keys.join(',')}${Object.keys(state).length > 10 ? '...' : ''})`);
+
+        // 1) 直接匹配 state[cid]
+        if (state[cid] !== undefined && Array.isArray(state[cid])) {
+          log(`findPinia: 直接匹配 ${storeId}[${cid}], len=${state[cid].length}`, 'success');
+          return state[cid];
+        }
+
+        // 2) 搜索 state 下一层
+        for (const key of keys) {
+          const v = state[key];
+          if (v && typeof v === 'object' && !Array.isArray(v) && v[cid] !== undefined && Array.isArray(v[cid])) {
+            log(`findPinia: ${storeId}.${key}[${cid}], len=${v[cid].length}`, 'success');
+            return v[cid];
+          }
+        }
+
+        // 3) 搜索 state[key][k2] 深度 2
+        for (const key of keys) {
+          const v = state[key];
+          if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+          for (const k2 of Object.keys(v)) {
+            const v2 = v[k2];
+            if (v2 && typeof v2 === 'object' && !Array.isArray(v2) && v2[cid] !== undefined && Array.isArray(v2[cid])) {
+              log(`findPinia: ${storeId}.${key}.${k2}[${cid}], len=${v2[cid].length}`, 'success');
+              return v2[cid];
+            }
+          }
+        }
       }
     }
   } catch (e) {
-    log(`findPiniaMessagesArray: ${e.message}`, 'warn');
+    log(`findPinia: 异常 ${e.message}`, 'warn');
   }
+  log(`findPinia: 未找到 ${cid}。stores: ${logStores.join(' | ') || '(无)'}`, 'warn');
   return null;
 }
 
 // ============================================================
 // 刷新 Roche 聊天界面
 // ============================================================
-// 方案 A：找到 Pinia store 的 reactive 数组 → 重读 DB → splice → 触发 Vue 重渲染
-// 方案 B：事件派发兜底
 async function refreshRocheChat(conversationId) {
   try {
     if (!conversationId) return;
     const cid = String(conversationId);
 
-    // ---- 方案 A：Pinia store 直改 ----
-    const found = findPiniaMessagesArray(cid);
-    if (found) {
+    // 方案 A：深搜 Pinia store → 直接读 IndexedDB → splice 触发 Vue reactivity
+    const piniaArr = findPiniaMessagesArray(cid);
+    if (piniaArr && Array.isArray(piniaArr)) {
       try {
-        let msgs = [];
-        try {
-          const result = await runtime.roche.memory.getShortTerm({ conversationId: cid, limit: 50 });
-          msgs = Array.isArray(result) ? result : (result?.messages || []);
-        } catch (apiErr) {
-          msgs = await getMessagesByConversation(cid);
-        }
-        if (msgs.length > 0) {
-          found.arr.splice(0, found.arr.length, ...msgs);
-          log(`refreshRocheChat: Pinia splice ${msgs.length} 条`, 'success');
+        // 直接读 IndexedDB（不经过 roche API，避免走 Pinia 缓存）
+        const dbMsgs = await getMessagesByConversation(cid);
+        if (dbMsgs.length > 0) {
+          // Vue 3 reactive 代理了数组的 splice 方法，会触发 UI 重渲染
+          piniaArr.splice(0, piniaArr.length, ...dbMsgs);
+          log(`refreshRocheChat: Pinia splice 成功, ${dbMsgs.length} 条`, 'success');
           return;
         }
       } catch (e) {
-        log(`refreshRocheChat: Pinia 异常: ${e.message}`, 'warn');
+        log(`refreshRocheChat: Pinia 操作异常: ${e.message}`, 'warn');
       }
     }
 
-    // ---- 方案 B：事件兜底 ----
+    // 方案 B：事件派发兜底
     try {
       window.dispatchEvent(new CustomEvent('roche-open-chat-request', {
-        detail: { conversationId: cid, pushType: '', source: 'xhs-reader-plugin' }
-      }));
-    } catch (e) {}
-    try {
-      document.dispatchEvent(new CustomEvent('roche-open-chat-request', {
         detail: { conversationId: cid, pushType: '', source: 'xhs-reader-plugin' }
       }));
     } catch (e) {}
@@ -1203,7 +1224,7 @@ async function initApp(root, roche) {
   const ball = document.getElementById('xhs-floating-ball');
   if (ball) ball.style.display = 'none';
   updateBallStatus(runtime.autoListen ? 'listening' : 'idle', runtime.autoListen ? '小红书注入器 (监听中)' : '小红书注入器 (未监听)');
-  log('插件已加载 v2.4.0', 'success');
+  log('插件已加载 v2.4.2', 'success');
 }
 
 function cleanup() {
@@ -1264,7 +1285,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.4.0 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.4.2 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1641,7 +1662,7 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.4.0 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.4.2 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });
