@@ -1,17 +1,21 @@
 /**
- * Roche 小红书链接注入器 v2.5.0
+ * Roche 小红书链接注入器 v2.5.1
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
  *                            注入：总结文本（详尽，500字左右）+ 评论 + 卡片占位符
  *
- * v2.5.0 关键改进（解决 APK vs 浏览器代理行为差异）：
- *   1. 新增 isApkWebView() 环境检测（UA 含 wv / Android Version）
- *   2. 新增 smartFetch() 区分真 HTTP 错误 vs CORS 拦截（TypeError 识别）
- *   3. 浏览器环境用 allorigins JSON 模式优先（CORS 头最完整）
- *   4. APK 环境保持原代理顺序（已验证可用）
- *   5. 显式 mode:'cors' + credentials:'omit' + redirect:'follow'
- *   6. 关闭面板不停止监听 / 恢复 autoListen / 会话上限 3 个（v2.4.x 特性保留）
+ * v2.5.1 关键改进（解决浏览器 corsproxy 403 问题）：
+ *   1. CF Worker 通用化 - 同时处理 HTML 和图片（用户配置后 HTML 也走 CF Worker）
+ *   2. corsproxy.io 免费版仅允许 localhost/GitHub.io 等 Origin 白名单
+ *      浏览器从非 localhost 打开 HTML 时 corsproxy 必然返回 403（无法绕过）
+ *      APK WebView 不发 Origin → corsproxy 放行（这就是 APK 能用的原因）
+ *   3. 智能代理选择：CF Worker > allorigins-json > codetabs > thingproxy > corsproxy
+ *   4. smartFetch 添加 referrerPolicy: 'no-referrer' 绕过部分代理 Referer 检查
+ *   5. 日志明确提示 corsproxy 403 原因，建议配置 CF Worker
+ *
+ * v2.5.0 特性保留：isApkWebView() / smartFetch() CORS 拦截识别
+ * v2.4.x 特性保留：关闭面板不停监听 / autoListen 恢复 / 会话上限 3 个
  *
  * 触发方式：监听消息库，用户回车后 2s 内立即替换
  * 重要：关闭面板后监听继续在后台运行
@@ -20,7 +24,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.5.0",
+  version: "2.5.1",
   apps: [
     {
       id: "xhs-reader-home",
@@ -204,7 +208,8 @@ async function smartFetch(proxyUrl, options = {}, timeoutMs = 15000) {
       signal: controller.signal,
       mode: 'cors',           // 显式声明跨域
       credentials: 'omit',    // 不带 Cookie，避免缓存干扰
-      redirect: 'follow'      // 跟随重定向
+      redirect: 'follow',     // 跟随重定向
+      referrerPolicy: 'no-referrer'  // 不发 Referer，绕过部分代理的 Referer 检查
     }, options);
     const resp = await fetch(proxyUrl, opts);
     clearTimeout(timeout);
@@ -227,14 +232,20 @@ async function smartFetch(proxyUrl, options = {}, timeoutMs = 15000) {
 /**
  * 返回 HTML 抓取的代理列表（按环境排序）
  *
+ * 浏览器环境：
+ *   - CF Worker 优先（如果配置了通用版 Worker，能处理 HTML）
+ *   - allorigins JSON 模式次之（CORS 头最友好）
+ *   - corsproxy 仅在 APK 或 localhost 可用（免费版 Origin 白名单限制）
+ *
  * APK 环境：保持原顺序（corsproxy 优先，已验证可用）
- * 浏览器环境：allorigins JSON 模式优先（CORS 头最友好）
  */
-function getHtmlProxies() {
+function getHtmlProxies(cfWorker) {
   const isApk = isApkWebView();
   if (isApk) {
     log(`环境检测: APK WebView (UA: ${(navigator.userAgent||'').substring(0,50)}...)`, 'info');
     return [
+      // APK 中 CF Worker 优先（如果配置了）
+      ...(cfWorker ? [{ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?type=html&url=' + encodeURIComponent(u) }] : []),
       { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` },
       { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
       { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
@@ -242,19 +253,36 @@ function getHtmlProxies() {
     ];
   }
   // 浏览器环境（含本地 file://）
-  log(`环境检测: 浏览器 (本地文件: ${isBrowserLocalFile()})`, 'info');
-  return [
-    // allorigins JSON 模式 - 返回 {contents: "..."}，CORS 头最完整
-    { name: 'allorigins-json', fn: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, jsonMode: true },
-    // codetabs - 长期稳定，CORS 支持好
-    { name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` },
-    // thingproxy
-    { name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` },
-    // allorigins raw 模式（备用）
-    { name: 'allorigins-raw', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` },
-    // corsproxy 最后（对浏览器最不友好）
-    { name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` }
-  ];
+  const isLocal = isBrowserLocalFile();
+  const origin = (typeof location !== 'undefined' ? location.origin : 'unknown');
+  log(`环境检测: 浏览器 (本地文件: ${isLocal}, Origin: ${origin})`, 'info');
+  if (!isLocal && origin && !/^(https?:\/\/(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.))/i.test(origin)) {
+    log(`⚠️ 当前 Origin 不在 corsproxy 免费白名单 → corsproxy 将返回 403`, 'warn');
+    if (!cfWorker) {
+      log(`⚠️ 建议在设置中配置 CF Worker 地址（可同时处理 HTML 和图片）`, 'warn');
+    }
+  }
+  const proxies = [];
+  // CF Worker 优先（如果配置了通用版 Worker）
+  if (cfWorker) {
+    proxies.push({ name: 'CF-Worker', fn: (u) => cfWorker.replace(/\/$/, '') + '?type=html&url=' + encodeURIComponent(u) });
+  }
+  // allorigins JSON 模式 - 返回 {contents: "..."}，CORS 头最完整
+  proxies.push({ name: 'allorigins-json', fn: (u) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, jsonMode: true });
+  // codetabs - 长期稳定，CORS 支持好
+  proxies.push({ name: 'codetabs', fn: (u) => `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(u)}` });
+  // thingproxy
+  proxies.push({ name: 'thingproxy', fn: (u) => `https://thingproxy.freeboard.io/fetch/${u}` });
+  // allorigins raw 模式（备用）
+  proxies.push({ name: 'allorigins-raw', fn: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}` });
+  // corsproxy 仅在 localhost 有效（其他 Origin 会 403）
+  if (isLocal || /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)/i.test(origin)) {
+    proxies.push({ name: 'corsproxy', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
+  } else {
+    // 非 localhost 环境，corsproxy 必然 403，放最后仅作尝试
+    proxies.push({ name: 'corsproxy(403预期)', fn: (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}` });
+  }
+  return proxies;
 }
 
 /**
@@ -294,8 +322,13 @@ const CORS_PROXIES = [
 ];
 
 async function fetchXhsHtml(xhsUrl) {
+  // 读取 CF Worker 地址（通用版可同时处理 HTML 和图片）
+  const cfWorker = await rocheStorage.get(STORE_KEYS.cfWorker);
+  if (cfWorker) {
+    log(`fetchXhsHtml: 检测到 CF Worker 配置，将优先使用`, 'info');
+  }
   // 根据环境动态选择代理顺序
-  const proxies = getHtmlProxies();
+  const proxies = getHtmlProxies(cfWorker);
 
   let lastErr = null;
   const errors = [];

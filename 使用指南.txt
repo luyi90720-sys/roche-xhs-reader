@@ -1,0 +1,184 @@
+============================================================
+  小红书链接注入器——使用指南 v2.4.2
+============================================================
+
+📌 一、安装插件
+
+  在 Roche 中，进入 设置 → 插件管理 → 添加插件，粘贴以下链接：
+
+  https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/manifest.json
+
+  点击安装即可。安装后，在插件列表中找到「小红书链接注入器」打开即可使用。
+
+
+📌 二、基本使用流程
+
+  1. 在 Roche 中打开插件面板（点击「小红书注入器」App）
+  2. 在「主面板」标签中，从下方「监听会话」列表勾选要监听的聊天（最多 3 个）
+  3. 勾选「启用自动监听」开关，状态显示为「运行中」
+  4. 此后，只要你在被监听会话中发送含小红书链接的消息，
+     插件会自动抓取笔记内容、下载图片，替换成 AI 可读格式注入聊天
+
+  *** 关闭插件面板后监听依然在后台运行，无需一直开着面板 ***
+
+
+📌 三、两种运行模式
+
+  在主面板可切换两种模式：
+
+  模式一（直注模式）：
+    - 抓取笔记全文 + 评论
+    - 注入文本消息 + 独立图片消息（最多 9 张）
+    - 最省事，AI 能看到完整内容和图片，但消耗 token 较多
+
+  模式二（副 API 总结模式）：
+    - 下载笔记图片 → 发给副 API（vision 多模态模型）生成 300-800 字总结
+    - 注入：总结文本 + 评论 + 卡片数据
+    - 不占图片 token，适合长笔记
+    - 需要先在「副 API」标签页配置一个 API 预设
+
+
+📌 四、配置副 API（模式二必需，模式一不需要）
+
+  切换到「副 API」标签页：
+
+  1. 点击「新建」
+  2. 填写：
+     - 预设名称：方便自己记的名字，如"默认"
+     - Base URL：API 接口地址，例如 https://api.openai.com
+     - API Key：你的 API 密钥
+     - 模型：点击「刷新」获取可用模型列表，选择一个支持 vision 的模型，
+       如 gpt-4o-mini、gpt-4o、claude-3-haiku 等
+     - Temperature：保持默认 0.5 即可
+  3. 点「测试连接」确认能通
+  4. 点「保存预设」
+  5. 回到主面板，切换到「模式二」
+
+
+📌 五、配置 Cloudflare Worker（强烈推荐！同时解决 HTML 抓取和图片下载）
+
+  小红书图片有防盗链，公共 CORS 代理对浏览器不友好。
+  corsproxy.io 免费版仅允许 localhost/GitHub.io 等 Origin 白名单，
+  浏览器从其他网站打开 HTML 时 corsproxy 必然返回 403。
+  APK WebView 不发 Origin 所以能用，浏览器发 Origin 必然被拒。
+
+  部署自己的 Cloudflare Worker 后：
+  - HTML 抓取走 CF Worker（彻底绕过 corsproxy 403）
+  - 图片下载走 CF Worker（绕过小红书防盗链）
+  - 行为与 APK 完全一致
+
+  以下是详细步骤（免费，无需服务器）：
+
+  === 第一步：注册 Cloudflare ===
+  1. 打开 https://dash.cloudflare.com/sign-up
+  2. 用邮箱注册账号，不需要绑信用卡
+  3. 注册完成后自动进入 Cloudflare 仪表盘（Dashboard）
+
+  === 第二步：创建 Worker ===
+  1. 在左侧菜单找到「Workers 和 Pages」（Workers & Pages）
+  2. 点击「创建」（Create）
+  3. 选择「创建 Worker」（Create Worker）
+  4. 给 Worker 起个名字，例如：xhs-proxy
+  5. 点击「部署」（Deploy），此时 Worker 创建完成
+
+  === 第三步：编辑 Worker 代码 ===
+  1. 在刚创建的 Worker 页面，点击「编辑代码」（Edit code）
+  2. 把编辑器里的默认代码全部删掉
+  3. 粘贴以下代码（注意：必须完全覆盖，一个字不漏）：
+
+------------------------------------------------------------
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const target = url.searchParams.get('url');
+    if (!target) return new Response('missing url', { status: 400 });
+    const resp = await fetch(target, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.xiaohongshu.com/' }
+    });
+    const body = await resp.arrayBuffer();
+    const headers = new Headers(resp.headers);
+    headers.set('Access-Control-Allow-Origin', '*');
+    return new Response(body, { status: resp.status, headers });
+  }
+}
+------------------------------------------------------------
+
+  4. 点击右上角「部署」（Deploy）
+  5. 部署成功后，页面上会显示 Worker 的网址，
+     格式类似：https://xhs-proxy.你的用户名.workers.dev
+
+  === 第四步：填入插件 ===
+  1. 复制上面那个 Worker 网址（完整的 https:// 开头）
+  2. 回到 Roche 小红书注入器 → 「设置」标签页
+  3. 粘贴到「Cloudflare Worker 代理地址」输入框
+  4. 点击「保存设置」
+  5. 完成！之后插件抓取 HTML 和下载图片时都会优先通过你的 Worker
+
+  ⚠️ 重要：浏览器打开 HTML 时如果不配置 CF Worker，
+     corsproxy 必然返回 403（这是 corsproxy.io 的政策，无法绕过），
+     只能用不稳定的公共代理。强烈建议配置 CF Worker。
+
+
+📌 六、手动注入
+
+  不想用自动监听，也可以手动粘贴链接注入：
+  1. 在主面板「手动注入」输入框粘贴小红书链接
+  2. 在下拉框选择要注入到的目标会话
+  3. 点击「注入」
+  4. 注入完成后目标会话中会出现笔记内容
+
+
+📌 七、预览功能
+
+  在注入之前想先看内容，可以点「预览抓取内容」按钮，
+  会在输入框下方显示抓取结果（不注入到聊天中）。
+
+
+📌 八、日志查看
+
+  遇到问题时，切换到「日志」标签页：
+  - 可以看到每次抓取、注入、下载图片的详细记录
+  - 点击「复制全部日志」可以复制出来发给别人帮忙排查
+
+
+📌 九、注意事项
+
+  1. 插件关闭面板后监听继续运行，如需停止，取消勾选「启用自动监听」
+  2. 最多同时监听 3 个会话
+  3. 注入后原消息会被替换，你发的链接+文字会消失，变成笔记内容
+  4. 模式一只注入最多 9 张图片
+  5. 如果图片下载失败（非 Cloudflare 用户常见），
+     文本和评论依然会正常注入，只是缺少图片
+  6. 不需要保持插件面板打开，关闭面板监听照常工作
+  7. Cloudflare Worker 完全免费，每天有 10 万次请求额度
+
+
+📌 十、常见问题
+
+  Q: 注入后聊天界面没刷新？
+  A: 切到另一个聊天再切回来即可看到。如果 Pinia 方案工作正常，
+     应该会无缝刷新（无感知），如果不行会自动用 viewStack 强制刷新。
+
+  Q: 图片总下载失败？
+  A: 有很大概率是因为没有配 Cloudflare Worker。
+     参考第五节部署一个自己的 Worker，成功率会大幅提升。
+
+  Q: 浏览器打开 HTML 时 corsproxy 返回 403？
+  A: 这是 corsproxy.io 的政策：免费版仅允许 localhost/GitHub.io 等
+     Origin 白名单。浏览器从其他网站打开 HTML 必然 403，无法绕过。
+     解决方案：配置 CF Worker（参考第五节），HTML 也走 CF Worker。
+
+  Q: APK 中能用 corsproxy，浏览器中不能？
+  A: APK WebView 不发 Origin header，corsproxy 认为"服务器端请求"放行。
+     浏览器强制发 Origin，corsproxy 检查 Origin 白名单，不在白名单返回 403。
+     这是浏览器与 APK 的根本差异，只能用 CF Worker 绕过。
+
+  Q: 副 API 连接测试失败？
+  A: 检查 Base URL 是否正确（注意不要多/少 /v1），
+     API Key 是否还有余额，模型名是否拼写正确。
+
+
+============================================================
+  文件版本：2026-07-19
+  插件版本：v2.5.1
+============================================================

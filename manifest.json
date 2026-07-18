@@ -1,8 +1,8 @@
 {
   "id": "xhs-reader",
   "name": "小红书链接注入器",
-  "version": "2.5.0",
-  "description": "小红书链接注入器 v2.5.0：解决 APK vs 浏览器代理行为差异。新增 isApkWebView() 环境检测、smartFetch() 区分 CORS 拦截 vs 真 HTTP 错误、浏览器环境用 allorigins JSON 模式优先、APK 环境保持原代理顺序。保留 v2.4.x 特性：关闭面板不停监听/autoListen 恢复/会话上限 3 个/extractXhsUrl 反引号修复",
+  "version": "2.5.1",
+  "description": "小红书链接注入器 v2.5.1：解决浏览器 corsproxy 403 问题。根因：corsproxy.io 免费版仅允许 localhost Origin，浏览器从非 localhost 打开 HTML 必然 403，APK WebView 不发 Origin 所以能用。修复：CF Worker 通用化同时处理 HTML 和图片（配置后 HTML 也走 CF Worker），智能代理选择，referrerPolicy no-referrer 绕过部分代理 Referer 检查",
   "author": "Roche Plugin",
   "entry": "https://raw.githubusercontent.com/luyi90720-sys/roche-xhs-reader/main/xhs-reader.js",
   "hash": "",
