@@ -1,5 +1,5 @@
 /**
- * Roche 小红书链接注入器 v2.6.2
+ * Roche 小红书链接注入器 v2.6.3
  *
  * 模式一（直注模式）：原文 + 独立图片消息
  * 模式二（副 API 总结模式）：下载图片 → 发给副 API（vision）总结 → 丢弃图片
@@ -25,7 +25,7 @@
 window.RochePlugin.register({
   id: "xhs-reader",
   name: "小红书链接注入器",
-  version: "2.6.2",
+  version: "2.6.3",
   apps: [
     {
       id: "xhs-reader-home",
@@ -424,35 +424,17 @@ function extractNote(state) {
 }
 
 function extractComments(state) {
-  // 尝试所有可能的评论数据路径（小红书不同版本结构不同）
-  const paths = [
-    () => state?.noteData?.data?.commentData,
-    () => {
-      const map = state?.note?.noteDetailMap;
-      const firstKey = Object.keys(map || {})[0];
-      return firstKey ? map[firstKey]?.comments : null;
-    },
-    () => state?.noteData?.data?.comments,
-    () => state?.note?.noteDetailMap && (() => {
-      const map = state.note.noteDetailMap;
-      const firstKey = Object.keys(map)[0];
-      return firstKey ? map[firstKey]?.note?.comments : null;
-    })(),
-    () => state?.comment,
-    () => state?.comments,
-    () => state?.noteData?.data?.noteData?.comments,
-    () => state?.note?.comments,
-  ];
-  for (let i = 0; i < paths.length; i++) {
-    try {
-      const cd = paths[i]();
-      if (cd && (cd.comments?.length || cd.length)) {
-        log(`extractComments: 命中路径 ${i + 1}`, 'info');
-        return cd;
-      }
-    } catch (e) {}
+  // 兼容两种 UA 返回的数据结构：
+  // - iPhone UA（移动版，有首屏评论）：state.noteData.data.commentData.comments
+  // - Chrome UA（桌面版，无首屏评论）：state.note.noteDetailMap[id].comments.list
+  const cd = state?.noteData?.data?.commentData;
+  if (cd?.comments?.length) return cd;
+  if (state?.note?.noteDetailMap) {
+    const map = state.note.noteDetailMap;
+    const firstKey = Object.keys(map)[0];
+    const c = firstKey ? map[firstKey]?.comments : null;
+    if (c) return c;
   }
-  log('extractComments: __INITIAL_STATE__ 中未找到评论数据（小红书评论通常由异步 API 加载，HTML 中不含）', 'warn');
   return null;
 }
 
@@ -551,26 +533,14 @@ async function downloadImageAsDataUrl(imageUrl) {
 async function processXhsLinkFull(xhsUrl) {
   const html = await fetchXhsHtml(xhsUrl);
   const state = parseXhsState(html);
-  // 调试：输出 state 的顶层 keys 和关键子结构
-  try {
-    const topKeys = Object.keys(state || {});
-    log(`parseXhsState: 顶层 keys = [${topKeys.join(', ')}]`, 'info');
-    if (state.noteData?.data) {
-      const dataKeys = Object.keys(state.noteData.data);
-      log(`parseXhsState: noteData.data keys = [${dataKeys.join(', ')}]`, 'info');
-    }
-    if (state.note?.noteDetailMap) {
-      const mapKeys = Object.keys(state.note.noteDetailMap);
-      const firstKey = mapKeys[0];
-      const firstEntry = firstKey ? state.note.noteDetailMap[firstKey] : null;
-      if (firstEntry) {
-        log(`parseXhsState: noteDetailMap[${firstKey}] keys = [${Object.keys(firstEntry).join(', ')}]`, 'info');
-      }
-    }
-  } catch (e) { log(`parseXhsState: 调试输出失败 ${e.message}`, 'warn'); }
   const note = extractNote(state);
   if (!note) throw new Error('未找到笔记数据');
   const comments = extractComments(state);
+  if (comments?.comments?.length) {
+    log(`抓取到 ${comments.comments.length} 条首屏评论`, 'success');
+  } else {
+    log('未抓取到首屏评论（可能为空或 UA 不匹配）', 'warn');
+  }
   const images = extractNoteImages(note);
   const tags = extractTags(note);
   const preview = extractPreview(note);
@@ -1477,7 +1447,7 @@ async function initApp(root, roche) {
   const ball = document.getElementById('xhs-floating-ball');
   if (ball) ball.style.display = 'none';
   updateBallStatus(runtime.autoListen ? 'listening' : 'idle', runtime.autoListen ? '小红书注入器 (监听中)' : '小红书注入器 (未监听)');
-  log('插件已加载 v2.6.2', 'success');
+  log('插件已加载 v2.6.3', 'success');
 }
 
 function cleanup() {
@@ -1538,7 +1508,7 @@ function render(root) {
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
         <div style="flex:1;min-width:0;">
           <h2 class="xhs-title">小红书链接注入器</h2>
-          <p class="xhs-subtitle">v2.6.2 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
+          <p class="xhs-subtitle">v2.6.3 · 模式${runtime.mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}</p>
         </div>
         <button class="xhs-btn" id="xhs-close-btn" title="退出插件面板（监听继续运行）" style="flex:0 0 auto;padding:6px 14px;font-size:13px;">退出</button>
       </div>
@@ -1956,7 +1926,7 @@ function bindEvents(roche) {
         b.classList.toggle('xhs-btn-primary', parseInt(b.dataset.mode) === mode);
       });
       const sub = root.querySelector('.xhs-subtitle');
-      if (sub) sub.textContent = `v2.6.2 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
+      if (sub) sub.textContent = `v2.6.3 · 模式${mode === 2 ? '二：副 API 详尽总结' : '一：直注模式'}`;
       roche.ui.toast(`已切换到模式${mode === 2 ? '二' : '一'}`);
       log(`模式切换为: ${mode === 2 ? '模式二（副 API 总结）' : '模式一（直注）'}`, 'info');
     });
